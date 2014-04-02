@@ -53,7 +53,8 @@ CREATE TABLE audit.logged_actions (
     action TEXT NOT NULL CHECK (action IN ('I','D','U', 'T')),
     row_data hstore,
     changed_fields hstore,
-    statement_only boolean not null
+    statement_only boolean not null,
+    primary_key_value text
 );
 
 REVOKE ALL ON audit.logged_actions FROM public;
@@ -76,6 +77,7 @@ COMMENT ON COLUMN audit.logged_actions.action IS 'Action type; I = insert, D = d
 COMMENT ON COLUMN audit.logged_actions.row_data IS 'Record value. Null for statement-level trigger. For INSERT this is the new tuple. For DELETE and UPDATE it is the old tuple.';
 COMMENT ON COLUMN audit.logged_actions.changed_fields IS 'New values of fields changed by UPDATE. Null except for row-level UPDATE events.';
 COMMENT ON COLUMN audit.logged_actions.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
+COMMENT ON COLUMN audit.logged_actions.primary_key_value IS 'Identifier of the modified row in audited table';
 
 CREATE INDEX logged_actions_relid_idx ON audit.logged_actions(relid);
 CREATE INDEX logged_actions_action_tstamp_tx_stm_idx ON audit.logged_actions(action_tstamp_stm);
@@ -89,6 +91,7 @@ DECLARE
     h_old hstore;
     h_new hstore;
     excluded_cols text[] = ARRAY[]::text[];
+    primary_key_name text;
 BEGIN
     IF TG_WHEN <> 'AFTER' THEN
         RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
@@ -110,28 +113,47 @@ BEGIN
         current_query(),                              -- top-level query or queries (if multistatement) from client
         substring(TG_OP,1,1),                         -- action
         NULL, NULL,                                   -- row_data, changed_fields
-        'f'                                           -- statement_only
+        'f',                                          -- statement_only
+        NULL                                          -- primary key value
         );
 
-    IF NOT TG_ARGV[0]::boolean IS DISTINCT FROM 'f'::boolean THEN
+    IF NOT TG_ARGV[0] IS NOT NULL THEN
+        primary_key_name = TG_ARGV[0]::text;
+    ELSE
+        SELECT
+          pg_attribute.attname
+        INTO primary_key_name
+        FROM pg_index, pg_class, pg_attribute
+        WHERE
+          pg_class.oid = TG_RELID AND
+          indrelid = pg_class.oid AND
+          pg_attribute.attrelid = pg_class.oid AND
+          pg_attribute.attnum = any(pg_index.indkey)
+          AND indisprimary;
+    END IF;
+
+    IF NOT TG_ARGV[1]::boolean IS DISTINCT FROM 'f'::boolean THEN
         audit_row.client_query = NULL;
     END IF;
 
-    IF TG_ARGV[1] IS NOT NULL THEN
-        excluded_cols = TG_ARGV[1]::text[];
+    IF TG_ARGV[2] IS NOT NULL THEN
+        excluded_cols = TG_ARGV[2]::text[];
     END IF;
     
     IF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
         audit_row.row_data = hstore(OLD.*);
         audit_row.changed_fields =  (hstore(NEW.*) - audit_row.row_data) - excluded_cols;
+        EXECUTE 'SELECT ($1).' || primary_key_name INTO audit_row.primary_key_value USING OLD;
         IF audit_row.changed_fields = hstore('') THEN
             -- All changed fields are ignored. Skip this update.
             RETURN NULL;
         END IF;
     ELSIF (TG_OP = 'DELETE' AND TG_LEVEL = 'ROW') THEN
         audit_row.row_data = hstore(OLD.*) - excluded_cols;
+        EXECUTE 'SELECT ($1).' || primary_key_name INTO audit_row.primary_key_value USING OLD;
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
         audit_row.row_data = hstore(NEW.*) - excluded_cols;
+        EXECUTE 'SELECT ($1).' || primary_key_name INTO audit_row.primary_key_value USING NEW;
     ELSIF (TG_LEVEL = 'STATEMENT' AND TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
         audit_row.statement_only = 't';
     ELSE
@@ -152,9 +174,11 @@ Track changes to a table at the statement and/or row level.
 
 Optional parameters to trigger in CREATE TRIGGER call:
 
-param 0: boolean, whether to log the query text. Default 't'.
+param 0: text, The name of the primary key field for the audited row
 
-param 1: text[], columns to ignore in updates. Default [].
+param 1: boolean, whether to log the query text. Default 't'.
+
+param 2: text[], columns to ignore in updates. Default [].
 
          Updates to ignored cols are omitted from changed_fields.
 
@@ -185,17 +209,29 @@ DECLARE
   stm_targets text = 'INSERT OR UPDATE OR DELETE OR TRUNCATE';
   _q_txt text;
   _ignored_cols_snip text = '';
+  _primary_key_name text;
 BEGIN
     EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_row ON ' || target_table;
     EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_stm ON ' || target_table;
 
-    IF audit_rows THEN
+    SELECT
+      pg_attribute.attname
+    INTO _primary_key_name
+    FROM pg_index, pg_class, pg_attribute
+    WHERE
+      pg_class.oid = target_table AND
+      indrelid = pg_class.oid AND
+      pg_attribute.attrelid = pg_class.oid AND
+      pg_attribute.attnum = any(pg_index.indkey)
+      AND indisprimary;
+
+  IF audit_rows THEN
         IF array_length(ignored_cols,1) > 0 THEN
             _ignored_cols_snip = ', ' || quote_literal(ignored_cols);
         END IF;
         _q_txt = 'CREATE TRIGGER audit_trigger_row AFTER INSERT OR UPDATE OR DELETE ON ' || 
                  target_table || 
-                 ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' ||
+                 ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' || quote_literal(_primary_key_name) || ', ' ||
                  quote_literal(audit_query_text) || _ignored_cols_snip || ');';
         RAISE NOTICE '%',_q_txt;
         EXECUTE _q_txt;
@@ -205,7 +241,7 @@ BEGIN
 
     _q_txt = 'CREATE TRIGGER audit_trigger_stm AFTER ' || stm_targets || ' ON ' ||
              target_table ||
-             ' FOR EACH STATEMENT EXECUTE PROCEDURE audit.if_modified_func('||
+             ' FOR EACH STATEMENT EXECUTE PROCEDURE audit.if_modified_func(' || quote_literal(_primary_key_name) || ', ' ||
              quote_literal(audit_query_text) || ');';
     RAISE NOTICE '%',_q_txt;
     EXECUTE _q_txt;
@@ -239,3 +275,14 @@ $$ LANGUAGE 'sql';
 COMMENT ON FUNCTION audit.audit_table(regclass) IS $body$
 Add auditing support to the given table. Row-level changes will be logged with full client query text. No cols are ignored.
 $body$;
+
+-- Create triggers on each public table to
+DO $$
+DECLARE
+    tables CURSOR FOR SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;
+    nbRow RECORD;
+BEGIN
+    FOR table_record IN tables LOOP
+        PERFORM audit.audit_table(table_record.tablename::regclass);
+    END LOOP;
+END$$;
