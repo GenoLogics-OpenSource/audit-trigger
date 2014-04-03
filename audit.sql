@@ -41,20 +41,21 @@ CREATE TABLE audit.logged_actions (
     schema_name text not null,
     table_name text not null,
     relid oid not null,
+    primary_key_value text,
     session_user_name text,
     action_tstamp_tx TIMESTAMP WITH TIME ZONE NOT NULL,
     action_tstamp_stm TIMESTAMP WITH TIME ZONE NOT NULL,
     action_tstamp_clk TIMESTAMP WITH TIME ZONE NOT NULL,
     transaction_id bigint,
     application_name text,
+    application_user text,
     client_addr inet,
     client_port integer,
     client_query text,
     action TEXT NOT NULL CHECK (action IN ('I','D','U', 'T')),
     row_data hstore,
     changed_fields hstore,
-    statement_only boolean not null,
-    primary_key_value text
+    statement_only boolean not null
 );
 
 REVOKE ALL ON audit.logged_actions FROM public;
@@ -64,6 +65,7 @@ COMMENT ON COLUMN audit.logged_actions.event_id IS 'Unique identifier for each a
 COMMENT ON COLUMN audit.logged_actions.schema_name IS 'Database schema audited table for this event is in';
 COMMENT ON COLUMN audit.logged_actions.table_name IS 'Non-schema-qualified table name of table event occured in';
 COMMENT ON COLUMN audit.logged_actions.relid IS 'Table OID. Changes with drop/create. Get with ''tablename''::regclass';
+COMMENT ON COLUMN audit.logged_actions.primary_key_value IS 'Identifier of the modified row in audited table';
 COMMENT ON COLUMN audit.logged_actions.session_user_name IS 'Login / session user whose statement caused the audited event';
 COMMENT ON COLUMN audit.logged_actions.action_tstamp_tx IS 'Transaction start timestamp for tx in which audited event occurred';
 COMMENT ON COLUMN audit.logged_actions.action_tstamp_stm IS 'Statement start timestamp for tx in which audited event occurred';
@@ -73,15 +75,32 @@ COMMENT ON COLUMN audit.logged_actions.client_addr IS 'IP address of client that
 COMMENT ON COLUMN audit.logged_actions.client_port IS 'Remote peer IP port address of client that issued query. Undefined for unix socket.';
 COMMENT ON COLUMN audit.logged_actions.client_query IS 'Top-level query that caused this auditable event. May be more than one statement.';
 COMMENT ON COLUMN audit.logged_actions.application_name IS 'Application name set when this audit event occurred. Can be changed in-session by client.';
+COMMENT ON COLUMN audit.logged_actions.application_user IS 'Application user logged into the application.';
 COMMENT ON COLUMN audit.logged_actions.action IS 'Action type; I = insert, D = delete, U = update, T = truncate';
 COMMENT ON COLUMN audit.logged_actions.row_data IS 'Record value. Null for statement-level trigger. For INSERT this is the new tuple. For DELETE and UPDATE it is the old tuple.';
 COMMENT ON COLUMN audit.logged_actions.changed_fields IS 'New values of fields changed by UPDATE. Null except for row-level UPDATE events.';
 COMMENT ON COLUMN audit.logged_actions.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
-COMMENT ON COLUMN audit.logged_actions.primary_key_value IS 'Identifier of the modified row in audited table';
 
 CREATE INDEX logged_actions_relid_idx ON audit.logged_actions(relid);
 CREATE INDEX logged_actions_action_tstamp_tx_stm_idx ON audit.logged_actions(action_tstamp_stm);
 CREATE INDEX logged_actions_action_idx ON audit.logged_actions(action);
+
+-- TODO add both types of comment
+CREATE TABLE audit.logged_action_properties (
+    event_property_id bigserial primary key,
+    event_id bigint,
+	propertyname text,
+	oldvalue text,
+	newvalue text
+)
+
+-- TODO add comment
+CREATE TABLE audit.application_user_log (
+    logid bigserial primary key,
+    username text
+);
+
+-- TODO Create Comment for application_user_log
 
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
 DECLARE
@@ -92,44 +111,43 @@ DECLARE
     h_new hstore;
     excluded_cols text[] = ARRAY[]::text[];
     primary_key_name text;
+    application_user text;
+    old_field_value text;
+    changed_field record;
 BEGIN
     IF TG_WHEN <> 'AFTER' THEN
         RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
     END IF;
+    
+    BEGIN
+    	SELECT username FROM audit.application_user_log WHERE logid = currval('audit.application_user_log_logid_seq') INTO application_user;
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    	-- do nothing
+    END;
 
     audit_row = ROW(
         nextval('audit.logged_actions_event_id_seq'), -- event_id
         TG_TABLE_SCHEMA::text,                        -- schema_name
         TG_TABLE_NAME::text,                          -- table_name
         TG_RELID,                                     -- relation OID for much quicker searches
+        NULL,                                          -- primary key value
         session_user::text,                           -- session_user_name
         current_timestamp,                            -- action_tstamp_tx
         statement_timestamp(),                        -- action_tstamp_stm
         clock_timestamp(),                            -- action_tstamp_clk
         txid_current(),                               -- transaction ID
         (SELECT setting FROM pg_settings WHERE name = 'application_name'),
+        application_user,							  -- application_user
         inet_client_addr(),                           -- client_addr
         inet_client_port(),                           -- client_port
         current_query(),                              -- top-level query or queries (if multistatement) from client
         substring(TG_OP,1,1),                         -- action
         NULL, NULL,                                   -- row_data, changed_fields
-        'f',                                          -- statement_only
-        NULL                                          -- primary key value
+        'f'                                          -- statement_only
         );
 
-    IF NOT TG_ARGV[0] IS NOT NULL THEN
+    IF TG_ARGV[0] IS NOT NULL THEN
         primary_key_name = TG_ARGV[0]::text;
-    ELSE
-        SELECT
-          pg_attribute.attname
-        INTO primary_key_name
-        FROM pg_index, pg_class, pg_attribute
-        WHERE
-          pg_class.oid = TG_RELID AND
-          indrelid = pg_class.oid AND
-          pg_attribute.attrelid = pg_class.oid AND
-          pg_attribute.attnum = any(pg_index.indkey)
-          AND indisprimary;
     END IF;
 
     IF NOT TG_ARGV[1]::boolean IS DISTINCT FROM 'f'::boolean THEN
@@ -143,11 +161,21 @@ BEGIN
     IF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
         audit_row.row_data = hstore(OLD.*);
         audit_row.changed_fields =  (hstore(NEW.*) - audit_row.row_data) - excluded_cols;
-        EXECUTE 'SELECT ($1).' || primary_key_name INTO audit_row.primary_key_value USING OLD;
         IF audit_row.changed_fields = hstore('') THEN
             -- All changed fields are ignored. Skip this update.
             RETURN NULL;
         END IF;
+
+        EXECUTE 'SELECT ($1).' || primary_key_name INTO audit_row.primary_key_value USING OLD;
+		FOR changed_field IN select * FROM each(audit_row.changed_fields) LOOP
+			EXECUTE 'SELECT ($1).' || changed_field.key INTO old_field_value USING OLD;
+			INSERT INTO audit.logged_action_properties (event_id, propertyname, oldvalue, newvalue) VALUES (
+				audit_row.event_id,
+				changed_field.key,
+				old_field_value,
+				changed_field.value
+			);
+		END LOOP;
     ELSIF (TG_OP = 'DELETE' AND TG_LEVEL = 'ROW') THEN
         audit_row.row_data = hstore(OLD.*) - excluded_cols;
         EXECUTE 'SELECT ($1).' || primary_key_name INTO audit_row.primary_key_value USING OLD;
